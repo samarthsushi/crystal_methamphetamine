@@ -5,12 +5,19 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
+use bytes::Bytes;
+use std::collections::HashMap;
+
+const TOTAL_SLOTS: u16 = 16384;
 
 #[derive(Clone)]
 struct Node {
     client_port: u16,
     bus_port: u16,
     peers: Vec<String>, 
+    data: HashMap<String, Bytes>,
+    start_slot: u16,
+    end_slot: u16
 }
 
 #[derive(Clone)]
@@ -19,11 +26,14 @@ struct ArcMutexNode {
 }
 
 impl ArcMutexNode {
-    pub async fn new(client_port: u16, bus_port: u16, peers: Vec<String>) -> Self {
+    pub async fn new(client_port: u16, bus_port: u16, peers: Vec<String>, start_slot: u16, end_slot: u16) -> Self {
         let node = Node {
             client_port,
             bus_port,
             peers,
+            data: HashMap::new(),
+            start_slot,
+            end_slot
         };
 
         ArcMutexNode {
@@ -99,6 +109,8 @@ impl ArcMutexNode {
                 Ok(n) => {
                     let request = String::from_utf8_lossy(&buffer[..n]);
                     let response = "OK\n";
+
+                    let response = self.parse_and_execute_command(&request).await;
     
                     if let Err(e) = socket.write_all(response.as_bytes()).await {
                         eprintln!("scope of error: handle_client_connection() :: socket.write_all() :: {e}");
@@ -110,6 +122,36 @@ impl ArcMutexNode {
                     break;
                 }
             }
+        }
+    }
+
+    async fn parse_and_execute_command(&self, command: &str) -> String {
+        let mut parts = command.split_whitespace();
+        let mut node_lock = self.inner.lock().await;
+
+        match parts.next() {
+            Some("set") => {
+                if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                    let value_bytes = Bytes::copy_from_slice(value.as_bytes());
+                    node_lock.data.insert(key.to_string(), value_bytes);
+                    "OK\n".to_string()
+                } else {
+                    "ERR wrong number of arguments for 'set' command\n".to_string()
+                }
+            }
+            Some("get") => {
+                if let Some(key) = parts.next() {
+                    if let Some(value) = node_lock.data.get(key) {
+                        format!("{}\n", String::from_utf8_lossy(value))
+                    } else {
+                        "(nil)\n".to_string()
+                    }
+                } else {
+                    "ERR wrong number of arguments for 'get' command\n".to_string()
+                }
+            }
+            Some(_) => "ERR unknown command\n".to_string(),
+            None => "ERR empty command\n".to_string(),
         }
     }
     
@@ -159,6 +201,56 @@ async fn check_peer_status(peer: &str) -> bool {
     }
 }
 
+struct Cluster {
+    nodes: Vec<u16>,
+    size: u16
+}
+
+impl Cluster {
+    fn new(size: usize) -> Self {
+        Cluster {
+            nodes: Vec::with_capacity(size),
+            size: size.try_into().unwrap()
+        }
+    }
+
+    fn build(&mut self, peers: Vec<String>, node_addr: u16) {
+        let mut nodes: Vec<u16> = peers
+            .into_iter()
+            .filter_map(|peer| peer.parse::<u16>().ok()) 
+            .collect();
+
+        nodes.push(node_addr);
+        nodes.sort();
+
+        self.nodes = nodes;
+    }
+
+    fn start_and_end_slots_of_addr(mut self, node_addr: u16) -> Option<(u16,u16)> {
+        let slot_size = TOTAL_SLOTS / self.size;
+        let extra_slots = TOTAL_SLOTS % self.size;
+
+        let mut start_slot = 0;
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let end_slot = if index < extra_slots.into() {
+                start_slot + slot_size
+            } else {
+                start_slot + slot_size - 1
+            };
+
+            if *node == node_addr {
+                return Some((start_slot, end_slot));
+            }
+
+            start_slot = end_slot + 1;
+        }
+
+        None
+
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>{
     let args: Vec<String> = std::env::args().collect();
@@ -173,8 +265,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     let bus_addr = node_addr + 10000;
     let peers: Vec<String> = args[2..].to_vec();
 
-    // todo: run node on node_addr
-    let node = ArcMutexNode::new(node_addr, bus_addr, peers);
+    let cluster_size = peers.len() + 1;
+    let mut cluster = Cluster::new(cluster_size);
+    cluster.build(peers.clone(), node_addr);
+
+    let (start, end) = cluster.start_and_end_slots_of_addr(node_addr).unwrap();
+
+    let node = ArcMutexNode::new(node_addr, bus_addr, peers, start, end);
     node.await.start().await;
 
     tokio::signal::ctrl_c().await?;
