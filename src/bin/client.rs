@@ -1,10 +1,9 @@
 use std::net::{TcpStream};
 use std::io::{self, Write, BufRead, BufReader};
-use std::env;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let server_addr = "127.0.0.1:" + args[1].clone();
+    let server_addr = "127.0.0.1:".to_owned() + &args[1].clone();
     println!("connecting to server at {}", server_addr);
 
     match TcpStream::connect(server_addr) {

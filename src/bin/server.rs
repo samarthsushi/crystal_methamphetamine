@@ -1,5 +1,5 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, self, BufReader, AsyncBufReadExt};
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -7,6 +7,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use bytes::Bytes;
 use std::collections::HashMap;
+
+use crystal_methamphetamine::crc16;
 
 const TOTAL_SLOTS: u16 = 16384;
 
@@ -17,7 +19,8 @@ struct Node {
     peers: Vec<String>, 
     data: HashMap<String, Bytes>,
     start_slot: u16,
-    end_slot: u16
+    end_slot: u16,
+    cluster: Cluster
 }
 
 #[derive(Clone)]
@@ -26,19 +29,24 @@ struct ArcMutexNode {
 }
 
 impl ArcMutexNode {
-    pub async fn new(client_port: u16, bus_port: u16, peers: Vec<String>, start_slot: u16, end_slot: u16) -> Self {
+    pub async fn new(client_port: u16, bus_port: u16, peers: Vec<String>, start_slot: u16, end_slot: u16, cluster: Cluster) -> Self {
         let node = Node {
             client_port,
             bus_port,
             peers,
             data: HashMap::new(),
             start_slot,
-            end_slot
+            end_slot,
+            cluster
         };
 
         ArcMutexNode {
             inner: Arc::new(Mutex::new(node))
         }
+    }
+
+    async fn owns_slot(&self, slot: u16) -> bool{
+        self.inner.lock().await.start_slot <= slot && slot <= self.inner.lock().await.end_slot
     }
 
     pub async fn start(self) {
@@ -127,24 +135,52 @@ impl ArcMutexNode {
 
     async fn parse_and_execute_command(&self, command: &str) -> String {
         let mut parts = command.split_whitespace();
-        let mut node_lock = self.inner.lock().await;
 
         match parts.next() {
             Some("set") => {
+
                 if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
                     let value_bytes = Bytes::copy_from_slice(value.as_bytes());
-                    node_lock.data.insert(key.to_string(), value_bytes);
-                    "OK\n".to_string()
+                    let slot = crc16::crc16_1021(&key.as_bytes());
+
+                    if self.owns_slot(slot).await {
+                        let mut node_lock = self.inner.lock().await;
+                        node_lock.data.insert(key.to_string(), value_bytes);
+                        "OK\n".to_string()
+                    } else {
+                        if let Some(responsible_node) = self.inner.lock().await.cluster.find_responsible_node(slot) {
+                            match self.forward_command(responsible_node.addr, format!("set {} {}", key, value)).await {
+                                Ok(response) => response,
+                                Err(e) => format!("ERR failed to forward command: {}\n", e),
+                            }
+                        } else {
+                            "ERR no node owns the slot for the given key\n".to_string()
+                        }
+                    }
                 } else {
                     "ERR wrong number of arguments for 'set' command\n".to_string()
                 }
             }
             Some("get") => {
                 if let Some(key) = parts.next() {
-                    if let Some(value) = node_lock.data.get(key) {
-                        format!("{}\n", String::from_utf8_lossy(value))
+                    let slot = crc16::crc16_1021(&key.as_bytes());
+
+                    if self.owns_slot(slot).await {
+                        let mut node_lock = self.inner.lock().await;
+                        if let Some(value) = node_lock.data.get(key) {
+                            format!("{}\n", String::from_utf8_lossy(value))
+                        } else {
+                            "(nil)\n".to_string()
+                        }
                     } else {
-                        "(nil)\n".to_string()
+                        if let Some(responsible_node) = self.inner.lock().await.cluster.find_responsible_node(slot) {
+                            match self.forward_command(responsible_node.addr, format!("get {}", key)).await {
+                                Ok(response) => response,
+                                Err(e) => format!("ERR failed to forward command: {}\n", e),
+                            }
+                        } else {
+                            "ERR no node owns the slot for the given key\n".to_string()
+                        }
                     }
                 } else {
                     "ERR wrong number of arguments for 'get' command\n".to_string()
@@ -153,6 +189,20 @@ impl ArcMutexNode {
             Some(_) => "ERR unknown command\n".to_string(),
             None => "ERR empty command\n".to_string(),
         }
+    }
+
+    async fn forward_command(&self, node_addr: u16, command: String) -> io::Result<String> {
+        let node_address = format!("127.0.0.1:{}", node_addr);
+
+        let mut stream = TcpStream::connect(node_address).await?;
+        stream.write_all(command.as_bytes()).await?;
+        stream.flush().await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader.read_line(&mut response).await?;
+
+        Ok(response.trim().to_string())
     }
     
     async fn handle_bus_connection(self, mut socket: TcpStream) {
@@ -201,8 +251,16 @@ async fn check_peer_status(peer: &str) -> bool {
     }
 }
 
+#[derive(Clone)]
+struct NodeMetadata {
+    addr: u16,
+    start_slot: u16,
+    end_slot: u16
+}
+
+#[derive(Clone)]
 struct Cluster {
-    nodes: Vec<u16>,
+    nodes: Vec<NodeMetadata>,
     size: u16
 }
 
@@ -215,39 +273,43 @@ impl Cluster {
     }
 
     fn build(&mut self, peers: Vec<String>, node_addr: u16) {
-        let mut nodes: Vec<u16> = peers
+        let mut addresses: Vec<u16> = peers
             .into_iter()
             .filter_map(|peer| peer.parse::<u16>().ok()) 
             .collect();
 
-        nodes.push(node_addr);
-        nodes.sort();
+        addresses.push(node_addr);
+        addresses.sort();
 
-        self.nodes = nodes;
-    }
-
-    fn start_and_end_slots_of_addr(mut self, node_addr: u16) -> Option<(u16,u16)> {
-        let slot_size = TOTAL_SLOTS / self.size;
+        let slots_per_node = TOTAL_SLOTS / self.size;
         let extra_slots = TOTAL_SLOTS % self.size;
 
         let mut start_slot = 0;
-
-        for (index, node) in self.nodes.iter().enumerate() {
-            let end_slot = if index < extra_slots.into() {
-                start_slot + slot_size
+        self.nodes = addresses.into_iter().enumerate().map(|(index, addr)| {
+            let end_slot = if index < extra_slots as usize {
+                start_slot + slots_per_node
             } else {
-                start_slot + slot_size - 1
+                start_slot + slots_per_node - 1
             };
 
-            if *node == node_addr {
-                return Some((start_slot, end_slot));
-            }
+            let node_metadata = NodeMetadata {
+                addr,
+                start_slot,
+                end_slot,
+            };
 
             start_slot = end_slot + 1;
-        }
 
-        None
+            node_metadata
+        }).collect();
+    }
 
+    fn get_slot_bounds_of_node(&self, node_addr: u16) -> Option<NodeMetadata> {
+        self.nodes.iter().find(|&node| node.addr == node_addr).cloned()
+    }
+
+    fn find_responsible_node(&self, slot: u16) -> Option<&NodeMetadata> {
+        self.nodes.iter().find(|node| node.start_slot <= slot && slot <= node.end_slot)
     }
 }
 
@@ -269,9 +331,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     let mut cluster = Cluster::new(cluster_size);
     cluster.build(peers.clone(), node_addr);
 
-    let (start, end) = cluster.start_and_end_slots_of_addr(node_addr).unwrap();
+    let node_metadata = cluster.get_slot_bounds_of_node(node_addr).unwrap();
 
-    let node = ArcMutexNode::new(node_addr, bus_addr, peers, start, end);
+    let node = ArcMutexNode::new(node_addr, bus_addr, peers, node_metadata.start_slot, node_metadata.end_slot, cluster);
     node.await.start().await;
 
     tokio::signal::ctrl_c().await?;
