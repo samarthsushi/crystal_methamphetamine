@@ -40,6 +40,8 @@ impl ArcMutexNode {
             cluster
         };
 
+        println!("slot bounds: {start_slot}-{end_slot}");
+
         ArcMutexNode {
             inner: Arc::new(Mutex::new(node))
         }
@@ -124,6 +126,13 @@ impl ArcMutexNode {
                         eprintln!("scope of error: handle_client_connection() :: socket.write_all() :: {e}");
                         break;
                     }
+
+                    if let Err(e) = socket.flush().await {
+                        eprintln!("scope of error: handle_client_connection() :: socket.flush() :: {e}");
+                        break;
+                    }
+
+                    println!("sent response");
                 }
                 Err(e) => {
                     eprintln!("scope of error: handle_client_connection() :: socket.read() :: {e}");
@@ -138,17 +147,22 @@ impl ArcMutexNode {
 
         match parts.next() {
             Some("set") => {
-
                 if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
                     let value_bytes = Bytes::copy_from_slice(value.as_bytes());
-                    let slot = crc16::crc16_1021(&key.as_bytes());
+                    let key_in_bytes = &key.as_bytes();
+                    let slot = crc16::crc16_1021(key_in_bytes);
+                    println!("key: {:?}, slot: {}", key_in_bytes, slot);
 
                     if self.owns_slot(slot).await {
                         let mut node_lock = self.inner.lock().await;
+                        println!("node owns slot, locked the node");
                         node_lock.data.insert(key.to_string(), value_bytes);
+                        println!("inserted data");
                         "OK\n".to_string()
                     } else {
+                        println!("node doesnt own slot");
                         if let Some(responsible_node) = self.inner.lock().await.cluster.find_responsible_node(slot) {
+                            println!("forward command to the responsible node: {}", responsible_node.addr);
                             match self.forward_command(responsible_node.addr, format!("set {} {}", key, value)).await {
                                 Ok(response) => response,
                                 Err(e) => format!("ERR failed to forward command: {}\n", e),
@@ -194,15 +208,24 @@ impl ArcMutexNode {
     async fn forward_command(&self, node_addr: u16, command: String) -> io::Result<String> {
         let node_address = format!("127.0.0.1:{}", node_addr);
 
-        let mut stream = TcpStream::connect(node_address).await?;
+        let mut stream = TcpStream::connect(&node_address).await?;
         stream.write_all(command.as_bytes()).await?;
         stream.flush().await?;
 
         let mut reader = BufReader::new(stream);
         let mut response = String::new();
-        reader.read_line(&mut response).await?;
-
-        Ok(response.trim().to_string())
+        match reader.read_line(&mut response).await {
+            Ok(0) => {
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ERR connection closed by node"))
+            }
+            Ok(_) => {
+                println!("received response from node {}: {}", node_address, response.trim());
+                Ok(response.to_string())
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
     }
     
     async fn handle_bus_connection(self, mut socket: TcpStream) {

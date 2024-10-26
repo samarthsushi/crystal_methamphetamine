@@ -1,57 +1,61 @@
-use std::net::{TcpStream};
-use std::io::{self, Write, BufRead, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::io::stdin;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let server_addr = "127.0.0.1:".to_owned() + &args[1].clone();
-    println!("connecting to server at {}", server_addr);
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let server_addr = "127.0.0.1:6379";
+    println!("Connecting to server at {}", server_addr);
 
-    match TcpStream::connect(server_addr) {
-        Ok(mut stream) => {
-            println!("conencted!");
+    // Connect to the server
+    let stream = TcpStream::connect(server_addr).await?;
+    println!("Connected!");
 
-            let stdin = io::stdin();
-            let mut input = String::new();
+    // Split the stream into a read half and a write half
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
-            loop {
-                print!("? ");
-                io::stdout().flush().unwrap();
-                input.clear();
-                
-                if let Err(e) = stdin.read_line(&mut input) {
-                    eprintln!("ERR reading input: {}", e);
-                    continue;
-                }
+    // REPL loop
+    loop {
+        // Use a buffered reader for stdin
+        let mut user_input = String::new();
+        let mut stdin_reader = BufReader::new(stdin());
 
-                let trimmed = input.trim();
+        // Prompt the user for input
+        print!("? ");
+        io::stdout().flush().await?; // Explicitly flush to ensure the prompt is displayed
 
-                if trimmed.eq_ignore_ascii_case("quit") {
-                    break;
-                }
+        // Read the user's command asynchronously
+        stdin_reader.read_line(&mut user_input).await?;
 
-                if let Err(e) = stream.write_all(trimmed.as_bytes()).and_then(|_| stream.write_all(b"\n")) {
-                    eprintln!("ERR sending message to server: {}", e);
-                    continue;
-                }
+        // Trim and write the command to the server
+        let command = user_input.trim().to_string();
+        if command.is_empty() {
+            continue;
+        }
 
-                let mut reader = BufReader::new(&stream);
-                let mut response = String::new();
-                match reader.read_line(&mut response) {
-                    Ok(_) => {
-                        if response.is_empty() {
-                            println!("no response");
-                        } else {
-                            println!("crystal_methamphetamine> {}", response.trim());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("ERR reading response from server: {}", e);
-                    }
-                }
+        println!("Sending command: {}", command); // Debugging info
+        write_half.write_all(command.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?; // Ensure the command is sent immediately
+        println!("Command sent!");
+
+        // Read the response from the server
+        let mut response = String::new();
+        match reader.read_line(&mut response).await {
+            Ok(0) => {
+                println!("Connection closed by server.");
+                break;
+            }
+            Ok(_) => {
+                println!("Server response: {}", response.trim());
+            }
+            Err(e) => {
+                println!("Failed to read response: {}", e);
+                break;
             }
         }
-        Err(e) => {
-            eprintln!("ERR connecting to server: {}", e);
-        }
     }
+
+    Ok(())
 }

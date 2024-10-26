@@ -55,7 +55,7 @@ pub fn crc16_1021(buf: &[u8]) -> u16 {
         crc = (crc << 8) ^ CRC16TABLE_1021[index];
     }
 
-    crc
+    crc % 16383
 }
 
 #[cfg(test)]
@@ -66,5 +66,11 @@ mod tests {
     fn it_works() {
         let s = b"123456789";
         assert_eq!(crc16_1021(s), 0x31C3);
+    }
+
+    #[test]
+    fn test_1() {
+        let s = b"keyy";
+        assert_eq!(crc16_1021(s), 10794);
     }
 }
