@@ -1,6 +1,5 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, self, BufReader, AsyncBufReadExt};
-use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::Duration;
@@ -42,7 +41,7 @@ impl ArcMutexNode {
 
         println!("slot bounds: {start_slot}-{end_slot}");
 
-        ArcMutexNode {
+        Self {
             inner: Arc::new(Mutex::new(node))
         }
     }
@@ -54,41 +53,36 @@ impl ArcMutexNode {
     pub async fn start(self) {
         let client_port = self.inner.lock().await.client_port;
         let bus_port = self.inner.lock().await.bus_port;
-        let client_listener = TcpListener::bind(format!("127.0.0.1:{}", client_port)).await.unwrap();
-        let bus_listener = TcpListener::bind(format!("127.0.0.1:{}", bus_port)).await.unwrap();
 
-        let node = self.clone();
-
-        node.monitor_peers().await;
+        let check_alive_daemon = self.clone();
+        tokio::spawn(async move {
+            check_alive_daemon
+                .monitor_peers()
+                .await
+        });
 
         let client_node = self.clone();
         tokio::spawn(async move {
-            println!("listening for clients on port {0}", client_port);
-            loop {
-                match client_listener.accept().await {
-                    Ok((socket, _)) => {
-                        let client_node = client_node.clone();
-                        tokio::spawn(async move {
-                            client_node.handle_client_connection(socket).await;
-                        });
-                    }
-                    Err(e) => eprintln!("scope of error: start :: client_listener :: accept :: {e}") 
+            if let Ok(client_listener) = TcpListener::bind(format!("127.0.0.1:{}", client_port)).await {
+                println!("listening for clients on port {0}", client_port);
+                while let Ok((socket, _)) = client_listener.accept().await {
+                    let client_node = client_node.clone();
+                    tokio::spawn(async move {
+                        client_node.handle_client_connection(socket).await;
+                    });
                 }
             }
         });
 
         let bus_node = self.clone();
         tokio::spawn(async move {
-            println!("listening to other nodes on port {0}", bus_port);
-            loop {
-                match bus_listener.accept().await {
-                    Ok((socket, _)) => {
-                        let bus_node = bus_node.clone();
-                        tokio::spawn(async move {
-                            bus_node.handle_bus_connection(socket).await;
-                        });
-                    }
-                    Err(e) => eprintln!("scope of error: start :: bus_listener :: accept :: {e}") //failed to accept connection
+            if let Ok(bus_listener) = TcpListener::bind(format!("127.0.0.1:{}", bus_port)).await {
+                println!("listening to other nodes on port {0}", bus_port);
+                while let Ok((socket, _)) = bus_listener.accept().await {
+                    let bus_node = bus_node.clone();
+                    tokio::spawn(async move {
+                        bus_node.handle_bus_connection(socket).await;
+                    });
                 }
             }
         });
@@ -97,17 +91,16 @@ impl ArcMutexNode {
     pub async fn monitor_peers(&self) {
         let peers = self.inner.lock().await.peers.clone();
         
-        tokio::spawn(async move {
-            loop {
-                for peer in &peers {
-                    let peer_addr = "127.0.0.1:".to_owned() + peer;
-                    let is_alive = check_peer_status(&peer_addr).await;
-                    println!("status of peer {}: {}", peer, if is_alive { "alive" } else { "not alive" });
-                }
-
-                sleep(Duration::from_secs(5)).await;
+        loop {
+            for peer in &peers {
+                let peer_addr = format!("127.0.0.1:{}", peer);
+                let is_alive = check_peer_status(&peer_addr).await;
+                println!("status of peer {}: {}", peer, if is_alive { "alive" } else { "not alive" });
             }
-        });
+
+            sleep(Duration::from_secs(5)).await;
+        }
+
     }
 
     async fn handle_client_connection(&self, mut socket: TcpStream) {
@@ -118,15 +111,12 @@ impl ArcMutexNode {
                 Ok(0) => break, 
                 Ok(n) => {
                     let request = String::from_utf8_lossy(&buffer[..n]);
-                    let response = "OK\n";
-
                     let response = self.parse_and_execute_command(&request).await;
     
                     if let Err(e) = socket.write_all(response.as_bytes()).await {
                         eprintln!("scope of error: handle_client_connection() :: socket.write_all() :: {e}");
                         break;
                     }
-
                     if let Err(e) = socket.flush().await {
                         eprintln!("scope of error: handle_client_connection() :: socket.flush() :: {e}");
                         break;
@@ -148,28 +138,22 @@ impl ArcMutexNode {
         match parts.next() {
             Some("set") => {
                 if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                    let value_bytes = Bytes::copy_from_slice(value.as_bytes());
-                    let key_in_bytes = &key.as_bytes();
-                    let slot = crc16::crc16_1021(key_in_bytes);
-                    println!("key: {:?}, slot: {}", key_in_bytes, slot);
+                    let slot = crc16::crc16_1021(key.as_bytes());
+                    println!("key: {:?}, slot: {}", key, slot);
 
                     if self.owns_slot(slot).await {
-                        let mut node_lock = self.inner.lock().await;
                         println!("node owns slot, locked the node");
-                        node_lock.data.insert(key.to_string(), value_bytes);
+                        self
+                            .inner.lock().await
+                            .data.insert(
+                                key.to_string(), 
+                                Bytes::copy_from_slice(value.as_bytes())
+                            );
                         println!("inserted data");
                         "OK\n".to_string()
                     } else {
                         println!("node doesnt own slot");
-                        if let Some(responsible_node) = self.inner.lock().await.cluster.find_responsible_node(slot) {
-                            println!("forward command to the responsible node: {}", responsible_node.addr);
-                            match self.forward_command(responsible_node.addr, format!("set {} {}", key, value)).await {
-                                Ok(response) => response,
-                                Err(e) => format!("ERR failed to forward command: {}\n", e),
-                            }
-                        } else {
-                            "ERR no node owns the slot for the given key\n".to_string()
-                        }
+                        self.forward_or_error(slot, command.to_string()).await
                     }
                 } else {
                     "ERR wrong number of arguments for 'set' command\n".to_string()
@@ -179,99 +163,55 @@ impl ArcMutexNode {
                 if let Some(key) = parts.next() {
                     let slot = crc16::crc16_1021(&key.as_bytes());
 
-                    if self.owns_slot(slot).await {
-                        let mut node_lock = self.inner.lock().await;
-                        if let Some(value) = node_lock.data.get(key) {
-                            format!("{}\n", String::from_utf8_lossy(value))
-                        } else {
-                            "(nil)\n".to_string()
-                        }
+                    if let Some(value) = self.get_or_forward(slot, key).await {
+                        value
                     } else {
-                        if let Some(responsible_node) = self.inner.lock().await.cluster.find_responsible_node(slot) {
-                            match self.forward_command(responsible_node.addr, format!("get {}", key)).await {
-                                Ok(response) => response,
-                                Err(e) => format!("ERR failed to forward command: {}\n", e),
-                            }
-                        } else {
-                            "ERR no node owns the slot for the given key\n".to_string()
-                        }
+                        "(nil)\n".to_string() // if (nil) is set as value by user for any key, it shows potential point of failure, need to develop a better protocol
                     }
                 } else {
                     "ERR wrong number of arguments for 'get' command\n".to_string()
                 }
             }
-            Some(_) => "ERR unknown command\n".to_string(),
-            None => "ERR empty command\n".to_string(),
+            _ => "ERR unknown command\n".to_string()
         }
     }
 
-    async fn forward_command(&self, node_addr: u16, command: String) -> io::Result<String> {
-        let node_address = format!("127.0.0.1:{}", node_addr);
+    async fn forward_or_error(&self, slot: u16, command: String) -> String {
+        if let Some(responsible_node) = self.inner.lock().await.cluster.find_responsible_node(slot) {
+            match self.forward_command(responsible_node.addr, command).await {
+                Ok(response) => response,
+                Err(e) => format!("ERR forwarding error: {e}\n"),
+            }
+        } else {
+            "ERR no node owns this slot\n".to_string()
+        }
+    }
 
-        let mut stream = TcpStream::connect(&node_address).await?;
+    async fn get_or_forward(&self, slot: u16, key: &str) -> Option<String> {
+        if self.owns_slot(slot).await {
+            let value = self.inner.lock().await.data.get(key).map(|v| String::from_utf8_lossy(v).to_string());
+            value.map(|v| format!("{v}\n"))
+        } else {
+            self.forward_or_error(slot, format!("get {key}")).await.into()
+        }
+    }
+
+    async fn forward_command(&self, node_addr: u16, command: String) -> tokio::io::Result<String> {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node_addr)).await?;
         stream.write_all(command.as_bytes()).await?;
         stream.flush().await?;
 
         let mut reader = BufReader::new(stream);
         let mut response = String::new();
-        match reader.read_line(&mut response).await {
-            Ok(0) => {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ERR connection closed by node"))
-            }
-            Ok(_) => {
-                println!("received response from node {}: {}", node_address, response.trim());
-                Ok(response.to_string())
-            }
-            Err(e) => {
-                Err(e)
-            }
-        }
+        reader.read_line(&mut response).await?;
+        Ok(response)
     }
     
-    async fn handle_bus_connection(self, mut socket: TcpStream) {
-        let mut buffer = [0; 1024];
-    
-        loop {
-            match socket.read(&mut buffer).await {
-                Ok(0) => break, // connection closed by client
-                Ok(n) => {
-                    let message = String::from_utf8_lossy(&buffer[..n]);
-                    
-                    if message.ends_with("ALIVE") { 
-                        if let Some((port, message_type)) = parse_alive_message(&message) {
-                            println!("node {port} state: ALIVE");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("scope of error: handle_client_connection() :: socket.read() :: {e}");
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn parse_alive_message(message: &str) -> Option<(u16, String)> {
-    let parts: Vec<&str> = message.trim().split("::").collect();
-    if parts.len() == 2 {
-        if let Ok(port) = parts[0].parse::<u16>() {
-            let message_type = parts[1].to_string();
-            return Some((port, message_type));
-        }
-    }
-    None
+    async fn handle_bus_connection(self, mut socket: TcpStream) {}
 }
 
 async fn check_peer_status(peer: &str) -> bool {
-    match TcpStream::connect(peer).await {
-        Ok(_) => {
-            true
-        }
-        Err(e) => {
-            false
-        }
-    }
+    TcpStream::connect(peer).await.is_ok()
 }
 
 #[derive(Clone)]
@@ -302,28 +242,17 @@ impl Cluster {
             .collect();
 
         addresses.push(node_addr);
-        addresses.sort();
+        addresses.sort_unstable();
 
-        let slots_per_node = TOTAL_SLOTS / self.size;
-        let extra_slots = TOTAL_SLOTS % self.size;
+        let slots_per_node = TOTAL_SLOTS / self.size as u16;
+        let extra_slots = TOTAL_SLOTS % self.size as u16;
 
         let mut start_slot = 0;
-        self.nodes = addresses.into_iter().enumerate().map(|(index, addr)| {
-            let end_slot = if index < extra_slots as usize {
-                start_slot + slots_per_node
-            } else {
-                start_slot + slots_per_node - 1
-            };
-
-            let node_metadata = NodeMetadata {
-                addr,
-                start_slot,
-                end_slot,
-            };
-
+        self.nodes = addresses.into_iter().enumerate().map(|(i, addr)| {
+            let end_slot = start_slot + slots_per_node - 1 + (i < extra_slots as usize) as u16;
+            let node = NodeMetadata { addr, start_slot, end_slot };
             start_slot = end_slot + 1;
-
-            node_metadata
+            node
         }).collect();
     }
 

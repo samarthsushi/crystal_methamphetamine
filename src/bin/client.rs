@@ -4,7 +4,7 @@ use tokio::io::stdin;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let server_addr = "127.0.0.1:6379";
+    let server_addr = "127.0.0.1:6380";
     println!("Connecting to server at {}", server_addr);
 
     // Connect to the server
