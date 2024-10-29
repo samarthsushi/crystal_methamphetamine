@@ -7,9 +7,7 @@ use tokio::time::sleep;
 use bytes::Bytes;
 use std::collections::HashMap;
 
-use crystal_methamphetamine::crc16;
-
-const TOTAL_SLOTS: u16 = 16384;
+use crystal_methamphetamine::{crc16, cluster};
 
 #[derive(Clone)]
 struct Node {
@@ -19,7 +17,7 @@ struct Node {
     data: HashMap<String, Bytes>,
     start_slot: u16,
     end_slot: u16,
-    cluster: Cluster
+    cluster: cluster::Cluster,
 }
 
 #[derive(Clone)]
@@ -28,7 +26,7 @@ struct ArcMutexNode {
 }
 
 impl ArcMutexNode {
-    pub async fn new(client_port: u16, bus_port: u16, peers: Vec<String>, start_slot: u16, end_slot: u16, cluster: Cluster) -> Self {
+    pub async fn new(client_port: u16, bus_port: u16, peers: Vec<String>, start_slot: u16, end_slot: u16, cluster: cluster::Cluster) -> Self {
         let node = Node {
             client_port,
             bus_port,
@@ -49,7 +47,7 @@ impl ArcMutexNode {
     async fn owns_slot(&self, slot: u16) -> bool{
         self.inner.lock().await.start_slot <= slot && slot <= self.inner.lock().await.end_slot
     }
-
+    
     pub async fn start(self) {
         let client_port = self.inner.lock().await.client_port;
         let bus_port = self.inner.lock().await.bus_port;
@@ -57,7 +55,7 @@ impl ArcMutexNode {
         let check_alive_daemon = self.clone();
         tokio::spawn(async move {
             check_alive_daemon
-                .monitor_peers()
+                .check_heartbeats()
                 .await
         });
 
@@ -88,7 +86,7 @@ impl ArcMutexNode {
         });
     }
 
-    pub async fn monitor_peers(&self) {
+    pub async fn check_heartbeats(&self) {
         let peers = self.inner.lock().await.peers.clone();
         
         loop {
@@ -214,57 +212,6 @@ async fn check_peer_status(peer: &str) -> bool {
     TcpStream::connect(peer).await.is_ok()
 }
 
-#[derive(Clone)]
-struct NodeMetadata {
-    addr: u16,
-    start_slot: u16,
-    end_slot: u16
-}
-
-#[derive(Clone)]
-struct Cluster {
-    nodes: Vec<NodeMetadata>,
-    size: u16
-}
-
-impl Cluster {
-    fn new(size: usize) -> Self {
-        Cluster {
-            nodes: Vec::with_capacity(size),
-            size: size.try_into().unwrap()
-        }
-    }
-
-    fn build(&mut self, peers: Vec<String>, node_addr: u16) {
-        let mut addresses: Vec<u16> = peers
-            .into_iter()
-            .filter_map(|peer| peer.parse::<u16>().ok()) 
-            .collect();
-
-        addresses.push(node_addr);
-        addresses.sort_unstable();
-
-        let slots_per_node = TOTAL_SLOTS / self.size as u16;
-        let extra_slots = TOTAL_SLOTS % self.size as u16;
-
-        let mut start_slot = 0;
-        self.nodes = addresses.into_iter().enumerate().map(|(i, addr)| {
-            let end_slot = start_slot + slots_per_node - 1 + (i < extra_slots as usize) as u16;
-            let node = NodeMetadata { addr, start_slot, end_slot };
-            start_slot = end_slot + 1;
-            node
-        }).collect();
-    }
-
-    fn get_slot_bounds_of_node(&self, node_addr: u16) -> Option<NodeMetadata> {
-        self.nodes.iter().find(|&node| node.addr == node_addr).cloned()
-    }
-
-    fn find_responsible_node(&self, slot: u16) -> Option<&NodeMetadata> {
-        self.nodes.iter().find(|node| node.start_slot <= slot && slot <= node.end_slot)
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>{
     let args: Vec<String> = std::env::args().collect();
@@ -275,20 +222,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
         return Ok(());
     }
 
-    let node_addr = args[1].clone().parse::<u16>().unwrap();
-    let bus_addr = node_addr + 10000;
-    let peers: Vec<String> = args[2..].to_vec();
+    // let node_addr = args[1].clone().parse::<u16>().unwrap();
+    // let bus_addr = node_addr + 10000;
+    // let peers: Vec<String> = args[2..].to_vec();
 
-    let cluster_size = peers.len() + 1;
-    let mut cluster = Cluster::new(cluster_size);
-    cluster.build(peers.clone(), node_addr);
+    // let cluster_size = peers.len() + 1;
+    // let mut cluster = Cluster::new(cluster_size);
+    // cluster.build(peers.clone(), node_addr);
 
-    let node_metadata = cluster.get_slot_bounds_of_node(node_addr).unwrap();
+    // let node_metadata = cluster.get_slot_bounds_of_node(node_addr).unwrap();
 
-    let node = ArcMutexNode::new(node_addr, bus_addr, peers, node_metadata.start_slot, node_metadata.end_slot, cluster);
-    node.await.start().await;
+    // let node = ArcMutexNode::new(node_addr, bus_addr, peers, node_metadata.start_slot, node_metadata.end_slot, cluster);
+    // node.await.start().await;
 
-    tokio::signal::ctrl_c().await?;
+    // tokio::signal::ctrl_c().await?;
 
     Ok(())
 }
