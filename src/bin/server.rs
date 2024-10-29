@@ -1,5 +1,14 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, self, BufReader, AsyncBufReadExt};
+use tokio::net::{
+    TcpListener, 
+    TcpStream
+};
+use tokio::io::{
+    AsyncReadExt, 
+    AsyncWriteExt, 
+    self, 
+    BufReader, 
+    AsyncBufReadExt
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::time::Duration;
@@ -7,7 +16,10 @@ use tokio::time::sleep;
 use bytes::Bytes;
 use std::collections::HashMap;
 
-use crystal_methamphetamine::{crc16, cluster};
+use crystal_methamphetamine::{
+    crc16, 
+    cluster
+};
 
 #[derive(Clone)]
 struct Node {
@@ -41,6 +53,21 @@ impl ArcMutexNode {
 
         Self {
             inner: Arc::new(Mutex::new(node))
+        }
+    }
+
+    async fn sync_data_with_replicas(&self, key: &str, value: &Bytes) {
+        let node = self.inner.lock().await;
+        let replicas = node
+            .cluster
+            .nodes
+            .iter()
+            .filter(|&n| n.replica_of == Some(node.client_port));
+
+        for replica in replicas {
+            if let Err(e) = self.forward_command(replica.addr, format!("set {} {}", key, String::from_utf8_lossy(value))).await {
+                eprintln!("ERR forward to sync with replica {}: {e}", replica.addr);
+            }
         }
     }
 
@@ -98,7 +125,6 @@ impl ArcMutexNode {
 
             sleep(Duration::from_secs(5)).await;
         }
-
     }
 
     async fn handle_client_connection(&self, mut socket: TcpStream) {
@@ -137,6 +163,7 @@ impl ArcMutexNode {
             Some("set") => {
                 if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
                     let slot = crc16::crc16_1021(key.as_bytes());
+                    let value_bytes = Bytes::copy_from_slice(value.as_bytes());
                     println!("key: {:?}, slot: {}", key, slot);
 
                     if self.owns_slot(slot).await {
@@ -145,9 +172,11 @@ impl ArcMutexNode {
                             .inner.lock().await
                             .data.insert(
                                 key.to_string(), 
-                                Bytes::copy_from_slice(value.as_bytes())
+                                value_bytes.clone()
                             );
                         println!("inserted data");
+                        self.sync_data_with_replicas(key, &value_bytes).await;
+                        println!("synced data with replicas");
                         "OK\n".to_string()
                     } else {
                         println!("node doesnt own slot");
