@@ -248,10 +248,8 @@ impl Server {
                     let cluster_snapshot = node.lock().await.cluster.clone();
                     println!("cluster snapshot: {:?}", cluster_snapshot);
                     for &port in cluster_snapshot.node_lookup.keys() {
-                        if port != incoming_port {
-                            println!("Broadcasting cluster update to node {}", port);
-                            Server::send_cluster_update(&node, port).await;
-                        }
+                        println!("Broadcasting cluster update to node {}", port);
+                        Server::send_cluster_update(&node, port).await;
                     }
                 }
                 ["CLUSTERMEET", incoming_port, replica_of] => {
@@ -271,10 +269,8 @@ impl Server {
                     let cluster_snapshot = node.lock().await.cluster.clone();
                     println!("cluster snapshot: {:?}", cluster_snapshot);
                     for &port in cluster_snapshot.node_lookup.keys() {
-                        if port != incoming_port {
-                            println!("Broadcasting cluster update to node {}", port);
-                            Server::send_cluster_update(&node, port).await;
-                        }
+                        println!("Broadcasting cluster update to node {}", port);
+                        Server::send_cluster_update(&node, port).await;
                     }
                 }
                 ["CLUSTERUPDATE", cluster_info] => {
@@ -341,6 +337,7 @@ impl Server {
             } else {
                 println!("Cluster update sent to {}", target_port);
             }
+            stream.flush().await.unwrap();
         } else {
             eprintln!("Failed to connect to node {} for cluster update", target_port);
         }
@@ -373,7 +370,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     }
 
     let bus_port: u16 = args[1].parse().expect("Invalid bus port number");
-    let cluster = Cluster::new();
+    let mut cluster = Cluster::new();
+    cluster.add(NodeMetadata { bus_port, role: NodeRole::Master });
     let node = Node::new(bus_port, NodeRole::Master, cluster);
     let server = Server::new(node);
 
