@@ -35,7 +35,7 @@ use tokio::net::TcpListener;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Duration;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum NodeRole {
     Master,
     Replica(u16)                                    // u16 holds port address of its Master
@@ -43,15 +43,29 @@ enum NodeRole {
 
 #[derive(Clone)]
 struct Node {
-    // port: u16,
-    bus_port:u16,
-    role: NodeRole,
+    metadata: NodeMetadata,
     cluster: Cluster
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+struct NodeMetadata {
+    // port: u16,
+    bus_port: u16,
+    role: NodeRole
+}
+
+impl NodeMetadata {
+    fn new(bus_port: u16, role: NodeRole) -> Self {
+        Self {
+            bus_port,
+            role
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Cluster {
-    node_lookup: HashMap<u16, Node>,                // maps port -> Node metadata
+    node_lookup: HashMap<u16, NodeMetadata>,                // maps port -> Node metadata
     replica_lookup: HashMap<u16, Vec<u16>>,         // maps Master port -> collection of its Replica ports
     is_alive_lookup: HashMap<u16, u8>,              // maps port in cluster -> missed PONG count
     pong_awaited: HashMap<u16, bool>,
@@ -91,7 +105,7 @@ impl Cluster {
         self.pong_awaited.insert(port, true);
     }
 
-    fn add(&mut self, node: Node) {
+    fn add(&mut self, node: NodeMetadata) {
         let node_port = node.bus_port;
         let node_role = node.role;
         self.node_lookup.insert(node_port, node);
@@ -111,8 +125,7 @@ impl Node {
         cluster: Cluster
     ) -> Self {
         Self {
-            bus_port,
-            role,
+            metadata: NodeMetadata::new(bus_port, role),
             cluster
         }
     }
@@ -120,18 +133,16 @@ impl Node {
 
 impl Server {
     fn new(
-        bus_port: u16,
-        role: NodeRole,
-        cluster: Cluster,
+        node: Node
     ) -> Self {
-        println!("Initializing server with bus_port: {}", bus_port);
+        println!("Initializing server with bus_port: {}", node.metadata.bus_port);
         Self {
-            inner: Arc::new(Mutex::new(Node::new(bus_port, role, cluster))),
+            inner: Arc::new(Mutex::new(node)),
         }
     }
 
     async fn start(self) {
-        let bus_port = self.inner.lock().await.bus_port;
+        let bus_port = self.inner.lock().await.metadata.bus_port;
         let listener = TcpListener::bind(("127.0.0.1", bus_port)).await.unwrap();
         println!("Server starting on bus_port: {}", bus_port);
 
@@ -177,12 +188,6 @@ impl Server {
                 }
             }
         });
-
-        // Keep the main task alive
-        loop {
-            println!("Server running on bus_port: {}", bus_port);
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
     }
 
     async fn handle_gossip(mut socket: TcpStream, node: Arc<Mutex<Node>>) {
@@ -205,7 +210,7 @@ impl Server {
 
             match message.split_whitespace().collect::<Vec<&str>>().as_slice() {
                 ["PING", source_port] => {
-                    let response_port = node.lock().await.bus_port;
+                    let response_port = node.lock().await.metadata.bus_port;
                     println!("Received PING from {}. Responding with PONG {}", source_port, response_port);
                     let source_port_as_int = source_port.parse::<u16>().unwrap();
                     if let Ok(mut pong_stream) = TcpStream::connect(("127.0.0.1", source_port_as_int)).await {
@@ -226,8 +231,118 @@ impl Server {
                     node.lock().await.cluster.mark_alive(source_port);
                     println!("Received PONG from {}", source_port);
                 }
+                ["CLUSTERMEET", incoming_port] => {
+                    let incoming_port: u16 = incoming_port.parse().unwrap();
+                    let role = NodeRole::Master;
+
+                    println!("CLUSTERMEET received from {} with role {:?}", incoming_port, role);
+
+                    {
+                        let mut cluster = node.lock().await.cluster.clone();
+                        let new_node = NodeMetadata::new(incoming_port, role);
+                        cluster.add(new_node);  
+                        node.lock().await.cluster = cluster;
+                        println!("Node {} added to the cluster", incoming_port);
+                    }
+
+                    let cluster_snapshot = node.lock().await.cluster.clone();
+                    println!("cluster snapshot: {:?}", cluster_snapshot);
+                    for &port in cluster_snapshot.node_lookup.keys() {
+                        if port != incoming_port {
+                            println!("Broadcasting cluster update to node {}", port);
+                            Server::send_cluster_update(&node, port).await;
+                        }
+                    }
+                }
+                ["CLUSTERMEET", incoming_port, replica_of] => {
+                    let incoming_port: u16 = incoming_port.parse().unwrap();
+                    let role = NodeRole::Replica(replica_of.parse().unwrap());
+
+                    println!("CLUSTERMEET received from {} with role {:?}", incoming_port, role);
+
+                    {
+                        let mut cluster = node.lock().await.cluster.clone();
+                        let new_node = NodeMetadata::new(incoming_port, role);
+                        cluster.add(new_node);  
+                        node.lock().await.cluster = cluster;
+                        println!("Node {} added to the cluster", incoming_port);
+                    }
+
+                    let cluster_snapshot = node.lock().await.cluster.clone();
+                    println!("cluster snapshot: {:?}", cluster_snapshot);
+                    for &port in cluster_snapshot.node_lookup.keys() {
+                        if port != incoming_port {
+                            println!("Broadcasting cluster update to node {}", port);
+                            Server::send_cluster_update(&node, port).await;
+                        }
+                    }
+                }
+                ["CLUSTERUPDATE", cluster_info] => {
+                    println!("Received CLUSTERUPDATE with info: {}", cluster_info);
+
+                    let incoming_nodes: Vec<(u16, NodeRole)> = cluster_info.split(',')
+                        .filter_map(|node_str| {
+                            let parts: Vec<&str> = node_str.split(':').collect();
+                            if parts.len() == 2 {
+                                let bus_port = parts[0].parse::<u16>().ok()?;
+                                let role = match parts[1] {
+                                    "Master" => NodeRole::Master,
+                                    "Replica" => NodeRole::Replica(bus_port),
+                                    _ => return None,  // Skip if role is unrecognized
+                                };
+                                Some((bus_port, role))
+                            } else {
+                                None // Skip if format is incorrect
+                            }
+                        })
+                        .collect();
+
+                    let mut cluster = node.lock().await.cluster.clone();
+
+                    for (bus_port, role) in incoming_nodes {
+                        if !cluster.node_lookup.contains_key(&bus_port) {
+                            println!("Adding new node from CLUSTERUPDATE: bus_port {} with role {:?}", bus_port, role);
+
+                            // Create and add a new Node entry with the specified bus_port and role
+                            let new_node = NodeMetadata::new(bus_port, role);
+                            cluster.add(new_node);
+                        }
+                    }
+                    node.lock().await.cluster = cluster;
+                    println!("Local cluster updated after applying CLUSTERUPDATE diff");
+                }
                 _ => println!("Unknown message received: {}", message),
             };
+        }
+    }
+
+    async fn send_cluster_update(node: &Arc<Mutex<Node>>, target_port: u16) {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", target_port)).await {
+            // Prepare cluster state message
+            let cluster_state = {
+                let node = node.lock().await;
+                let cluster_info = node.cluster.node_lookup.iter()
+                    .map(|(&bus_port, node)| {
+                        // Convert role to a string
+                        let role_str = match node.role {
+                            NodeRole::Master => "Master",
+                            NodeRole::Replica(_) => "Replica",
+                        };
+                        format!("{}:{}", bus_port, role_str)
+                    })
+                    .collect::<Vec<String>>()
+                    .join(",");
+                format!("CLUSTERUPDATE {}\n", cluster_info)
+            };
+
+            println!("Sending cluster update to {}: {}", target_port, cluster_state);
+            if let Err(e) = stream.write_all(cluster_state.as_bytes()).await {
+                eprintln!("Failed to send cluster update to {}: {}", target_port, e);
+            } else {
+                println!("Cluster update sent to {}", target_port);
+            }
+        } else {
+            eprintln!("Failed to connect to node {} for cluster update", target_port);
         }
     }
 
@@ -250,40 +365,20 @@ impl Server {
 
     
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>>{
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
-        eprintln!("Usage: {} <port> <bus_port>", args[0]);
+    if args.len() != 2 {
+        eprintln!("Usage: {} <bus_port>", args[0]);
         std::process::exit(1);
     }
 
-    let bus_port: u16 = args[2].parse().expect("Invalid bus port number");
-    let other_bus_port: u16 = args[4].parse().expect("Invalid other node bus port number");
-
-    let mut cluster = Cluster {
-        node_lookup: HashMap::new(),
-        replica_lookup: HashMap::new(),
-        is_alive_lookup: HashMap::new(),
-        pong_awaited: HashMap::new(),
-    };
-
-    let other_node = Node {
-        bus_port: other_bus_port,
-        role: NodeRole::Master, 
-        cluster: cluster.clone(),
-    };
-    cluster.node_lookup.insert(other_bus_port, other_node.clone());
-    cluster.is_alive_lookup.insert(other_bus_port, 0);
-
-    let node = Node {
-        bus_port,
-        role: NodeRole::Master, 
-        cluster
-    };
-
-    let server = Server {
-        inner: Arc::new(Mutex::new(node)),
-    };
+    let bus_port: u16 = args[1].parse().expect("Invalid bus port number");
+    let cluster = Cluster::new();
+    let node = Node::new(bus_port, NodeRole::Master, cluster);
+    let server = Server::new(node);
 
     server.start().await;
+    tokio::signal::ctrl_c().await?;
+
+    Ok(())
 }
