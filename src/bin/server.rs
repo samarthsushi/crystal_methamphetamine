@@ -43,7 +43,7 @@ enum NodeRole {
 
 #[derive(Clone)]
 struct Node {
-    port: u16,
+    // port: u16,
     bus_port:u16,
     role: NodeRole,
     cluster: Cluster
@@ -92,7 +92,7 @@ impl Cluster {
     }
 
     fn add(&mut self, node: Node) {
-        let node_port = node.port;
+        let node_port = node.bus_port;
         let node_role = node.role;
         self.node_lookup.insert(node_port, node);
         if let NodeRole::Replica(master_port) = node_role {
@@ -106,13 +106,11 @@ impl Cluster {
 
 impl Node {
     fn new(
-        port: u16,
         bus_port:u16,
         role: NodeRole,
         cluster: Cluster
     ) -> Self {
         Self {
-            port,
             bus_port,
             role,
             cluster
@@ -122,19 +120,17 @@ impl Node {
 
 impl Server {
     fn new(
-        port: u16,
         bus_port: u16,
         role: NodeRole,
         cluster: Cluster,
     ) -> Self {
-        println!("Initializing server with port: {} and bus_port: {}", port, bus_port);
+        println!("Initializing server with bus_port: {}", bus_port);
         Self {
-            inner: Arc::new(Mutex::new(Node::new(port, bus_port, role, cluster))),
+            inner: Arc::new(Mutex::new(Node::new(bus_port, role, cluster))),
         }
     }
 
     async fn start(self) {
-        let self_port = self.inner.lock().await.port;
         let bus_port = self.inner.lock().await.bus_port;
         let listener = TcpListener::bind(("127.0.0.1", bus_port)).await.unwrap();
         println!("Server starting on bus_port: {}", bus_port);
@@ -157,16 +153,16 @@ impl Server {
         // Ping service
         let ping_service = self.inner.clone();
         tokio::spawn(async move {
-            println!("Starting ping service on port: {}", self_port);
+            println!("Starting ping service on port: {}", bus_port);
             loop {
                 let mut node = ping_service.lock().await;
                 let ports: Vec<u16> = node.cluster.node_lookup.keys().cloned().collect();
 
                 for &port in &ports {
-                    if port != self_port {
+                    if port != bus_port {
                         node.cluster.set_pong_awaited(port);
                         println!("Sending PING to node {}", port);
-                        Server::send_ping(&ping_service, port).await;
+                        Server::send_ping(bus_port, port).await;
                     }
                 }
 
@@ -209,7 +205,7 @@ impl Server {
 
             match message.split_whitespace().collect::<Vec<&str>>().as_slice() {
                 ["PING", source_port] => {
-                    let response_port = node.lock().await.port;
+                    let response_port = node.lock().await.bus_port;
                     println!("Received PING from {}. Responding with PONG {}", source_port, response_port);
                     let source_port_as_int = source_port.parse::<u16>().unwrap();
                     if let Ok(mut pong_stream) = TcpStream::connect(("127.0.0.1", source_port_as_int)).await {
@@ -235,10 +231,9 @@ impl Server {
         }
     }
 
-    async fn send_ping(server: &Arc<Mutex<Node>>, target_port: u16) {
+    async fn send_ping(self_port: u16, target_port: u16) {
         println!("Attempting to send PING to target port: {}", target_port);
         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", target_port)).await {
-            let self_port = server.lock().await.port;
             let message = format!("PING {}\n", self_port);
             println!("Sending PING message: {}", message);
             if let Err(e) = stream.write_all(message.as_bytes()).await {
@@ -262,9 +257,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let port: u16 = args[1].parse().expect("Invalid port number");
     let bus_port: u16 = args[2].parse().expect("Invalid bus port number");
-    let other_port: u16 = args[3].parse().expect("Invalid other node port number");
     let other_bus_port: u16 = args[4].parse().expect("Invalid other node bus port number");
 
     let mut cluster = Cluster {
@@ -275,7 +268,6 @@ async fn main() {
     };
 
     let other_node = Node {
-        port: other_port,
         bus_port: other_bus_port,
         role: NodeRole::Master, 
         cluster: cluster.clone(),
@@ -284,7 +276,6 @@ async fn main() {
     cluster.is_alive_lookup.insert(other_bus_port, 0);
 
     let node = Node {
-        port,
         bus_port,
         role: NodeRole::Master, 
         cluster
